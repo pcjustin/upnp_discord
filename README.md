@@ -68,6 +68,61 @@ what Discord is given. Without `cloudflared` everything still works, minus the a
    node index.js
    ```
 
+## Keeping it running (macOS)
+
+`launchd` starts it at login and restarts it if it dies. Write
+`~/Library/LaunchAgents/com.example.upnp-discord.plist`, with the two absolute paths
+replaced by yours (`which node` and the checkout directory):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.upnp-discord</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/absolute/path/to/node</string>
+        <string>/absolute/path/to/upnp_discord/index.js</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/absolute/path/to/upnp_discord</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/you/Library/Logs/upnp-discord.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/you/Library/Logs/upnp-discord.log</string>
+</dict>
+</plist>
+```
+
+`PATH` is not decoration: agents start with a minimal one that excludes Homebrew, so
+without it `cloudflared` is never found and cover art quietly stops working.
+
+```sh
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.upnp-discord.plist
+launchctl print gui/$(id -u)/com.example.upnp-discord | grep -E 'state|pid'
+tail -f ~/Library/Logs/upnp-discord.log
+
+launchctl kickstart -k gui/$(id -u)/com.example.upnp-discord   # restart after an edit
+launchctl bootout gui/$(id -u)/com.example.upnp-discord        # stop and unload
+```
+
+Point `ProgramArguments` at a real node binary, not a shim: a version manager's path
+carries the version in it, so the agent stops starting after an upgrade and the only
+sign is a presence that never appears.
+
 ## Installing cloudflared
 
 Only cover art needs it — everything else works without it, and it needs no Cloudflare
