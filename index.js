@@ -10,6 +10,9 @@ const { spawn } = require("child_process");
 const CONFIG_FILE = path.join(__dirname, "config.json");
 const IMAGE_PORT = 47122;
 const POLL_MS = 5000;
+// Playback advances by about one poll interval between polls; dragging the timeline
+// jumps much further, or backwards. Anything past this is treated as a manual seek.
+const SEEK_TOLERANCE = 5;
 const SERVICE = "urn:schemas-upnp-org:service:AVTransport:1";
 
 // --- Pure parsing helpers (exported for tests) ---
@@ -72,7 +75,43 @@ function formatLine(line) {
     return line.slice(0, 128);
 }
 
-module.exports = { decode, tag, hms, parseTrack, formatLine };
+// MinimServer advertises the embedded picture of the album's first track, which 404s
+// for albums whose art sits beside the files as an image instead of inside them - so
+// the folder image is tried next rather than giving up on a broken advertised URL.
+function artCandidates(track) {
+    const dir = /^https?:/.test(track.id) ? track.id.replace(/\/[^/]*$/, "") : null;
+    return [track.art, dir && dir + "/cover.jpg", dir && dir + "/folder.jpg"].filter(Boolean);
+}
+
+// A renderer's own description document is the only place its friendly name appears,
+// and the control URL in it may be relative to where the document was fetched from.
+function parseDescription(xml, location) {
+    const service = (xml.match(/<service>[\s\S]*?<\/service>/g) || []).find((s) =>
+        (tag(s, "serviceType") || "").includes("AVTransport")
+    );
+    if (!service) return null;
+    return {
+        name: (tag(xml, "friendlyName") || "").trim(),
+        control: new URL((tag(service, "controlURL") || "").trim(), location).href,
+    };
+}
+
+// Substring rather than equality: a friendly name usually carries a serial number the
+// owner has no reason to type out. An empty name matches everything, which takes the
+// first renderer that answers - the right behaviour on a one-streamer network.
+function matchRenderer(renderers, wanted) {
+    const needle = (wanted || "").trim().toLowerCase();
+    return renderers.find((r) => r.name.toLowerCase().includes(needle)) || null;
+}
+
+// How far the renderer's position has drifted from what Discord is already showing.
+// Infinity for a different track, which always needs a new payload.
+function presenceDrift(current, next, now) {
+    if (!current || current.id !== next.id) return Infinity;
+    return Math.abs(next.position - (current.position + (now - current.at) / 1000));
+}
+
+module.exports = { decode, tag, hms, parseTrack, formatLine, artCandidates, parseDescription, matchRenderer, presenceDrift };
 
 if (require.main !== module) return;
 
@@ -195,14 +234,6 @@ function startTunnel() {
     });
 }
 
-// MinimServer advertises the embedded picture of the album's first track, which 404s
-// for albums whose art sits beside the files as an image instead of inside them - so
-// the folder image is tried next rather than giving up on a broken advertised URL.
-function artCandidates(track) {
-    const dir = /^https?:/.test(track.id) ? track.id.replace(/\/[^/]*$/, "") : null;
-    return [track.art, dir && dir + "/cover.jpg", dir && dir + "/folder.jpg"].filter(Boolean);
-}
-
 async function loadArt(track) {
     const candidates = artCandidates(track);
     if (!candidates.length) return null;
@@ -276,14 +307,8 @@ async function describeRenderers() {
         } catch {
             continue;
         }
-        const service = (xml.match(/<service>[\s\S]*?<\/service>/g) || []).find((s) =>
-            (tag(s, "serviceType") || "").includes("AVTransport")
-        );
-        if (!service) continue;
-        renderers.push({
-            name: (tag(xml, "friendlyName") || "").trim(),
-            control: new URL((tag(service, "controlURL") || "").trim(), location).href,
-        });
+        const renderer = parseDescription(xml, location);
+        if (renderer) renderers.push(renderer);
     }
     return renderers;
 }
@@ -300,10 +325,7 @@ async function listRenderers() {
 }
 
 async function discover() {
-    // An empty rendererName matches everything, which takes the first renderer that
-    // answers - the right behaviour when there is only one on the network.
-    const wanted = (config.rendererName || "").trim().toLowerCase();
-    const renderer = (await describeRenderers()).find((r) => r.name.toLowerCase().includes(wanted));
+    const renderer = matchRenderer(await describeRenderers(), config.rendererName);
     if (!renderer) return null;
     console.log("Renderer found:", renderer.name, "-", renderer.control);
     return renderer.control;
@@ -361,10 +383,9 @@ async function poll() {
         // timestamps. Only a new track or a real seek needs a new payload - and a seek
         // does, or the bar keeps counting from the old position. Playback drift across
         // one interval stays well under the threshold; dragging the timeline does not.
-        const sameTrack = track && track.id === next.id;
-        const drift = sameTrack ? Math.abs(next.position - (track.position + (Date.now() - track.at) / 1000)) : 0;
-        if (sameTrack && drift < 5) return;
-        if (sameTrack) console.log("Seek detected, drift " + Math.round(drift) + "s");
+        const drift = presenceDrift(track, next, Date.now());
+        if (drift < SEEK_TOLERANCE) return;
+        if (Number.isFinite(drift)) console.log("Seek detected, drift " + Math.round(drift) + "s");
 
         next.at = Date.now();
         track = next;
