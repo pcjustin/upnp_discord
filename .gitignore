@@ -1,0 +1,5 @@
+node_modules/
+cloudflared
+cloudflared.exe
+*.log
+config.json
