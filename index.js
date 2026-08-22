@@ -13,7 +13,10 @@ const POLL_MS = 5000;
 // Playback advances by about one poll interval between polls; dragging the timeline
 // jumps much further, or backwards. Anything past this is treated as a manual seek.
 const SEEK_TOLERANCE = 5;
-const SERVICE = "urn:schemas-upnp-org:service:AVTransport:1";
+const AVTRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1";
+const CONTENT_DIRECTORY = "urn:schemas-upnp-org:service:ContentDirectory:1";
+const RENDERER_ST = "urn:schemas-upnp-org:device:MediaRenderer:1";
+const SERVER_ST = "urn:schemas-upnp-org:device:MediaServer:1";
 
 // --- Pure parsing helpers (exported for tests) ---
 
@@ -83,11 +86,11 @@ function artCandidates(track) {
     return [track.art, dir && dir + "/cover.jpg", dir && dir + "/folder.jpg"].filter(Boolean);
 }
 
-// A renderer's own description document is the only place its friendly name appears,
+// A device's own description document is the only place its friendly name appears,
 // and the control URL in it may be relative to where the document was fetched from.
-function parseDescription(xml, location) {
+function parseDescription(xml, location, wanted = "AVTransport") {
     const service = (xml.match(/<service>[\s\S]*?<\/service>/g) || []).find((s) =>
-        (tag(s, "serviceType") || "").includes("AVTransport")
+        (tag(s, "serviceType") || "").includes(wanted)
     );
     if (!service) return null;
     return {
@@ -111,7 +114,14 @@ function presenceDrift(current, next, now) {
     return Math.abs(next.position - (current.position + (now - current.at) / 1000));
 }
 
-module.exports = { decode, tag, hms, parseTrack, formatLine, artCandidates, parseDescription, matchRenderer, presenceDrift };
+// A ContentDirectory Search answers with a DIDL-Lite document escaped into <Result>,
+// so the art URL sits two layers of entities down.
+function artFromSearchResult(xml) {
+    const art = tag(decode(tag(xml, "Result") || ""), "upnp:albumArtURI");
+    return art ? decode(art).trim() : null;
+}
+
+module.exports = { decode, tag, hms, parseTrack, formatLine, artCandidates, parseDescription, matchRenderer, presenceDrift, artFromSearchResult };
 
 if (require.main !== module) return;
 
@@ -234,25 +244,32 @@ function startTunnel() {
     });
 }
 
+async function fetchFirst(urls) {
+    for (const url of urls) {
+        try {
+            const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+            if (!res.ok) continue;
+            return {
+                buffer: Buffer.from(await res.arrayBuffer()),
+                contentType: res.headers.get("content-type") || "image/jpeg",
+            };
+        } catch (err) {
+            console.error("Cover art fetch failed:", err.message);
+        }
+    }
+    return null;
+}
+
 async function loadArt(track) {
     const candidates = artCandidates(track);
     if (!candidates.length) return null;
     const key = crypto.createHash("md5").update(candidates[0]).digest("hex").slice(0, 12);
     if (images.has(key)) return images.get(key) ? key : null;
 
-    let value = null;
-    for (const url of candidates) {
-        try {
-            const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-            if (!res.ok) continue;
-            value = {
-                buffer: Buffer.from(await res.arrayBuffer()),
-                contentType: res.headers.get("content-type") || "image/jpeg",
-            };
-            break;
-        } catch (err) {
-            console.error("Cover art fetch failed:", err.message);
-        }
+    let value = await fetchFirst(candidates);
+    if (!value) {
+        const recovered = await recoverArtUri(track);
+        if (recovered) value = await fetchFirst([recovered]);
     }
     if (!value) console.error("No cover art found for:", track.title);
     // A failure is cached as deliberately as a success: an unrecorded failure means
@@ -269,7 +286,7 @@ let controlUrl = null;
 // LinkPlay-based renderers serve their description on a dynamic port that moves after
 // a reboot, so the control URL is discovered rather than configured, and rediscovered
 // whenever a request to it fails.
-function ssdpSearch() {
+function ssdpSearch(st) {
     return new Promise((resolve) => {
         const sock = dgram.createSocket({ type: "udp4", reuseAddr: true });
         const locations = new Set();
@@ -278,7 +295,7 @@ function ssdpSearch() {
             "HOST: 239.255.255.250:1900\r\n" +
             'MAN: "ssdp:discover"\r\n' +
             "MX: 2\r\n" +
-            "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n"
+            "ST: " + st + "\r\n\r\n"
         );
         sock.on("error", () => {});
         sock.on("message", (buf) => {
@@ -297,9 +314,9 @@ function ssdpSearch() {
 
 // The friendly name lives in the description document, not in the SSDP reply, so every
 // answer has to be fetched before any of them can be matched against rendererName.
-async function describeRenderers() {
+async function describeDevices(st, wanted) {
     const renderers = [];
-    for (const location of await ssdpSearch()) {
+    for (const location of await ssdpSearch(st)) {
         let xml;
         try {
             const res = await fetch(location, { signal: AbortSignal.timeout(5000) });
@@ -307,14 +324,14 @@ async function describeRenderers() {
         } catch {
             continue;
         }
-        const renderer = parseDescription(xml, location);
+        const renderer = parseDescription(xml, location, wanted);
         if (renderer) renderers.push(renderer);
     }
     return renderers;
 }
 
 async function listRenderers() {
-    const renderers = await describeRenderers();
+    const renderers = await describeDevices(RENDERER_ST, "AVTransport");
     if (!renderers.length) {
         console.log("No UPnP renderer answered. Is the streamer powered up and on this network?");
         return;
@@ -325,28 +342,61 @@ async function listRenderers() {
 }
 
 async function discover() {
-    const renderer = matchRenderer(await describeRenderers(), config.rendererName);
+    const renderer = matchRenderer(await describeDevices(RENDERER_ST, "AVTransport"), config.rendererName);
     if (!renderer) return null;
     console.log("Renderer found:", renderer.name, "-", renderer.control);
     return renderer.control;
 }
 
-function soap(action) {
+function soap(url, service, action, args) {
     const body =
         '<?xml version="1.0"?>' +
         '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" ' +
         's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>' +
-        `<u:${action} xmlns:u="${SERVICE}"><InstanceID>0</InstanceID></u:${action}>` +
+        `<u:${action} xmlns:u="${service}">${args}</u:${action}>` +
         "</s:Body></s:Envelope>";
-    return fetch(controlUrl, {
+    return fetch(url, {
         method: "POST",
-        headers: { "Content-Type": 'text/xml; charset="utf-8"', SOAPAction: `"${SERVICE}#${action}"` },
+        headers: { "Content-Type": 'text/xml; charset="utf-8"', SOAPAction: `"${service}#${action}"` },
         body,
         signal: AbortSignal.timeout(5000),
     }).then((res) => {
         if (!res.ok) throw new Error(action + " returned HTTP " + res.status);
         return res.text();
     });
+}
+
+const transport = (action) => soap(controlUrl, AVTRANSPORT, action, "<InstanceID>0</InstanceID>");
+
+// The renderer truncates every DIDL field at 256 characters, so a deep path - and a
+// CJK one is mostly percent escapes - loses the tail of upnp:albumArtURI and the URL
+// it advertises 404s. TrackURI arrives whole because it is its own SOAP argument, so
+// the media server that wrote the metadata can be asked for the item again by it.
+let contentDirectory = null;
+
+async function recoverArtUri(track) {
+    if (!/^https?:/.test(track.id)) return null;
+    try {
+        if (!contentDirectory) {
+            const host = new URL(track.id).hostname;
+            const servers = await describeDevices(SERVER_ST, "ContentDirectory");
+            const server = servers.find((s) => new URL(s.control).hostname === host);
+            if (!server) return null;
+            contentDirectory = server.control;
+            console.log("Media server found:", server.name, "-", server.control);
+        }
+        const criteria = `res = &quot;${track.id.replace(/&/g, "&amp;")}&quot;`;
+        const xml = await soap(contentDirectory, CONTENT_DIRECTORY, "Search",
+            "<ContainerID>0</ContainerID>" +
+            `<SearchCriteria>${criteria}</SearchCriteria>` +
+            "<Filter>upnp:albumArtURI</Filter><StartingIndex>0</StartingIndex>" +
+            "<RequestedCount>1</RequestedCount><SortCriteria></SortCriteria>");
+        return artFromSearchResult(xml);
+    } catch (err) {
+        console.error("Could not ask the media server for cover art:", err.message);
+        contentDirectory = null;
+        return null;
+    }
 }
 
 // --- Presence ---
@@ -364,7 +414,7 @@ async function poll() {
             }
         }
 
-        const state = tag(await soap("GetTransportInfo"), "CurrentTransportState");
+        const state = tag(await transport("GetTransportInfo"), "CurrentTransportState");
         if (state !== "PLAYING" && state !== "TRANSITIONING") {
             if (track) {
                 console.log("Renderer is " + state + ", clearing presence.");
@@ -375,7 +425,7 @@ async function poll() {
             return;
         }
 
-        const next = parseTrack(await soap("GetPositionInfo"));
+        const next = parseTrack(await transport("GetPositionInfo"));
         if (!next) return;
 
         // A poll every few seconds would otherwise redraw the presence constantly for

@@ -73,3 +73,13 @@ test("a name that matches nothing is not silently substituted", () => {
     assert.strictEqual(matchRenderer(RENDERERS, "Kitchen"), null);
     assert.strictEqual(matchRenderer([], "anything"), null);
 });
+
+test("the same lookup finds a media server's ContentDirectory", () => {
+    // The recovery path reuses discovery with a different service, so asking for
+    // ContentDirectory must skip AVTransport rather than take the first service listed.
+    const xml = DESCRIPTION.replace("AVTransport", "ContentDirectory");
+    assert.strictEqual(
+        parseDescription(xml, LOCATION, "ContentDirectory").control,
+        "http://10.0.0.20:49152/upnp/control/rendertransport1"
+    );
+});

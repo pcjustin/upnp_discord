@@ -160,6 +160,10 @@ cache until it is fully quit (⌘Q on macOS, closing the window is not enough) a
 - MinimServer advertises the album's art as the first track's embedded picture, which
   404s when the art sits beside the files instead. `cover.jpg` / `folder.jpg` in the
   album folder are tried next.
+- The renderer truncates every metadata field at 256 characters, so a deep path — and a
+  CJK one is mostly percent escapes — loses the tail of the art URL and it 404s. When
+  every candidate fails, the media server is asked for the track again by its full URI,
+  which is where the whole art URL comes back from.
 - Cover art can take a few seconds to appear after a restart. Discord fetches the URL
   through its own media proxy and caches it, and the quick tunnel hands out a fresh
   hostname on every run, so the first fetch of a run is always a cold one.

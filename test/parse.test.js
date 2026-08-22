@@ -5,7 +5,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert");
-const { parseTrack, hms, decode, formatLine } = require("../index.js");
+const { parseTrack, hms, decode, formatLine, artFromSearchResult } = require("../index.js");
 
 const SAMPLE = `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
 <u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
@@ -59,4 +59,24 @@ test("formatLine keeps Discord's length limits", () => {
     assert.strictEqual(formatLine("愛"), "愛 ");
     assert.strictEqual(formatLine("x".repeat(200)).length, 128);
     assert.strictEqual(formatLine(undefined), undefined);
+});
+
+// The renderer cut this track's upnp:albumArtURI off at 256 characters; the media
+// server's own answer to a Search for the same res is where the whole URL comes back.
+const SEARCH_RESULT = `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body>
+<u:SearchResponse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">
+<Result>&lt;DIDL-Lite&gt;&lt;item id=&quot;0$1&quot;&gt;&lt;upnp:albumArtURI dlna:profileID=&quot;JPEG_LRG&quot;&gt;http://10.0.0.30:9790/minimserver/*/Music/a&amp;amp;b.flac/$!picture-686-944282.jpg&lt;/upnp:albumArtURI&gt;&lt;/item&gt;&lt;/DIDL-Lite&gt;</Result>
+<NumberReturned>1</NumberReturned>
+</u:SearchResponse>
+</s:Body></s:Envelope>`;
+
+test("the media server's full art URL survives both entity layers", () => {
+    assert.strictEqual(
+        artFromSearchResult(SEARCH_RESULT),
+        "http://10.0.0.30:9790/minimserver/*/Music/a&b.flac/$!picture-686-944282.jpg"
+    );
+});
+
+test("a search that matched nothing yields no art", () => {
+    assert.strictEqual(artFromSearchResult("<Result></Result><NumberReturned>0</NumberReturned>"), null);
 });
